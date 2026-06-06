@@ -90,7 +90,7 @@ Issues fixed while debugging:
   JoyVASA HuBERT/Wav2Vec2 encoders load with `attn_implementation="eager"`
   because their wrappers request `output_attentions=True`.
 
-## Mona Lisa Text-To-Video Web UI
+## Text-To-Animation Web UI
 
 A dedicated fast-path Gradio entry point was added:
 
@@ -99,31 +99,47 @@ docker run -it --gpus=all --rm \
   -v "$PWD":/root/FasterLivePortrait \
   -w /root/FasterLivePortrait \
   -p 9871:9871 \
-  flp python3 mona_lisa_webui.py --mode onnx --host_ip 0.0.0.0 --port 9871
+  flp python3 text_to_animation_webui.py --mode onnx --host_ip 0.0.0.0 --port 9871
 ```
 
 Files involved:
 
-- `mona_lisa_webui.py`
-- `assets/examples/source/mona_lisa.jpg`
+- `text_to_animation_webui.py`
+- `assets/examples/source/*.jpg`
 - `src/pipelines/gradio_live_portrait_pipeline.py`
 - `src/pipelines/faster_live_portrait_pipeline.py`
 
 Behavior and speed-oriented changes:
 
-- The site uses a fixed Mona Lisa source image and only accepts text/voice
-  settings.
-- The source image and Kokoro voice pipeline are prewarmed/cached at startup.
+- The site accepts a source image from upload, webcam/clipboard, or bundled
+  examples, and accepts text/voice settings.
+- The voice dropdown is populated from `checkpoints/Kokoro-82M/voices/*.pt`.
+  It defaults to the preferred English voice list in `text_to_animation_webui.py`,
+  currently starting with `af_heart`, then other English Kokoro voices.
+- The source image and selected default Kokoro voice pipeline are
+  prewarmed/cached at startup.
 - `GradioLivePortraitPipeline` now caches Kokoro model, voices, and language
   pipelines via `get_kokoro_pipeline()`.
-- The Mona app shows detailed timing: Kokoro, JoyVASA, render, muxing, frame
-  count, per-frame model time, and ONNX Runtime providers.
-- Crop-only output is the default. When `Full Painting` is off, the render path
-  skips full original-frame upload/download, paste-back, full-video writing, and
-  full-video audio muxing.
+- The text-to-animation app shows detailed timing: Kokoro, JoyVASA, render,
+  muxing, frame count, per-frame model time, and ONNX Runtime providers.
+- Defaults now favor matching the main `webui.py` text-animation quality:
+  `Full Image` output, `Frame Step` 1, `relative motion` off, `stitching` on,
+  driving multiplier 1.0, `cfg_scale` 4.0, source crop on with scale 2.3/X
+  0.0/Y -0.125, animation region `all`, and motion smooth strength `1e-7`.
+- Crop-only output remains available as a speed option. When `Full Image` is
+  off, the render path skips full original-frame upload/download, paste-back,
+  full-video writing, and full-video audio muxing.
 - A `Frame Step` slider was added. It renders every Nth motion frame and lowers
-  output FPS so audio duration stays aligned. This trades smoothness for lower
-  latency.
+  output FPS so audio duration stays aligned. Values above 1 trade smoothness
+  for lower latency.
+- The text-to-animation app exposes the main still-image text controls from
+  `webui.py`: source crop on/off, source crop scale/X/Y, relative motion,
+  stitching, driving multiplier, CFG scale, animation region, and motion smooth
+  strength.
+- It intentionally does not expose unrelated or broader `webui.py` workflows:
+  source video, driving video/image/audio/pickle tabs, driving-video crop
+  controls, video-to-video head rotation, retargeting, reset buttons, or the
+  animal model toggle.
 
 Measured user run in ONNX mode on an RTX 4070 Laptop GPU at 100 W:
 
@@ -213,14 +229,14 @@ checkpoints/liveportrait_onnx/motion_extractor.trt
 checkpoints/liveportrait_onnx/appearance_feature_extractor.trt
 ```
 
-Then run the Mona app with TensorRT:
+Then run the text-to-animation app with TensorRT:
 
 ```bash
 docker run -it --gpus=all --rm \
   -v "$PWD":/root/FasterLivePortrait \
   -w /root/FasterLivePortrait \
   -p 9871:9871 \
-  flp python3 mona_lisa_webui.py --mode trt --host_ip 0.0.0.0 --port 9871
+  flp python3 text_to_animation_webui.py --mode trt --host_ip 0.0.0.0 --port 9871
 ```
 
 The user ran TRT mode after building engines and hit a source-prep crash:
@@ -274,7 +290,7 @@ may be owned by another user:
 
 ```bash
 PYTHONPYCACHEPREFIX=/tmp/flp-pycache python3 -m py_compile \
-  mona_lisa_webui.py \
+  text_to_animation_webui.py \
   src/pipelines/gradio_live_portrait_pipeline.py \
   src/pipelines/faster_live_portrait_pipeline.py \
   src/pipelines/joyvasa_audio_to_motion_pipeline.py \

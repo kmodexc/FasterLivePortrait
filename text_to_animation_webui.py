@@ -1,6 +1,7 @@
 # coding: utf-8
 import argparse
 import os
+import os.path as osp
 import time
 
 import gradio as gr
@@ -9,17 +10,31 @@ from omegaconf import OmegaConf
 from src.pipelines.gradio_live_portrait_pipeline import GradioLivePortraitPipeline
 
 
-MONA_LISA_PATH = "assets/examples/source/mona_lisa.jpg"
+DEFAULT_SOURCE_PATH = "assets/examples/source/s9.jpg"
+EXAMPLE_SOURCE_DIR = "assets/examples/source"
+PREFERRED_ENGLISH_VOICES = (
+    "af_heart",
+    "af_bella",
+    "af_nicole",
+    "af_sarah",
+    "af_sky",
+    "am_adam",
+    "am_michael",
+    "bf_emma",
+    "bf_isabella",
+    "bm_george",
+    "bm_lewis",
+)
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="Mona Lisa text-to-video web UI")
+    parser = argparse.ArgumentParser(description="Text-to-animation web UI")
     parser.add_argument("--mode", required=False, type=str, default="onnx", choices=["onnx", "trt"])
     parser.add_argument("--use_mp", action="store_true", help="use mediapipe face detection")
     parser.add_argument("--host_ip", type=str, default="127.0.0.1", help="host ip")
     parser.add_argument("--port", type=int, default=9871, help="server port")
-    parser.add_argument("--source_image", type=str, default=MONA_LISA_PATH, help="fixed source image")
-    parser.add_argument("--no_prewarm", action="store_true", help="skip source/voice warmup at launch")
+    parser.add_argument("--source_image", type=str, default=DEFAULT_SOURCE_PATH, help="default source image")
+    parser.add_argument("--no_prewarm", action="store_true", help="skip default source/voice warmup at launch")
     return parser
 
 
@@ -42,22 +57,57 @@ def list_voices():
     return sorted(voices) or ["af_heart"]
 
 
-def configure_fast_path(paste_back=False, cfg_scale=1.2, driving_multiplier=1.0):
+def default_voice_for(voices):
+    for voice in PREFERRED_ENGLISH_VOICES:
+        if voice in voices:
+            return voice
+    for voice in voices:
+        if voice.startswith(("a", "b")):
+            return voice
+    return voices[0]
+
+
+def list_source_examples():
+    if not os.path.isdir(EXAMPLE_SOURCE_DIR):
+        return []
+    image_exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+    examples = [
+        [osp.join(EXAMPLE_SOURCE_DIR, name)]
+        for name in sorted(os.listdir(EXAMPLE_SOURCE_DIR))
+        if osp.splitext(name)[1].lower() in image_exts
+    ]
+    return examples
+
+
+def configure_fast_path(
+        source_path,
+        paste_back=True,
+        cfg_scale=4.0,
+        driving_multiplier=1.0,
+        flag_relative_motion=False,
+        flag_do_crop=True,
+        flag_stitching=True,
+        animation_region="all",
+        src_scale=2.3,
+        src_vx_ratio=0.0,
+        src_vy_ratio=-0.125,
+        driving_smooth_observation_variance=1e-7,
+):
     return pipeline.update_cfg({
-        "source": args.source_image,
+        "source": source_path,
         "driving": "",
-        "flag_relative_motion": True,
-        "flag_do_crop": True,
+        "flag_relative_motion": flag_relative_motion,
+        "flag_do_crop": flag_do_crop,
         "flag_pasteback": paste_back,
         "driving_multiplier": driving_multiplier,
-        "flag_stitching": True,
+        "flag_stitching": flag_stitching,
         "flag_crop_driving_video": False,
         "flag_video_editing_head_rotation": False,
-        "src_scale": 2.3,
-        "src_vx_ratio": 0.0,
-        "src_vy_ratio": -0.125,
-        "driving_smooth_observation_variance": 1e-7,
-        "animation_region": "all",
+        "src_scale": src_scale,
+        "src_vx_ratio": src_vx_ratio,
+        "src_vy_ratio": src_vy_ratio,
+        "driving_smooth_observation_variance": driving_smooth_observation_variance,
+        "animation_region": animation_region,
         "cfg_scale": cfg_scale,
     })
 
@@ -68,35 +118,70 @@ def prewarm():
     if not os.path.exists(args.source_image):
         print(f"skip prewarm, source image is missing: {args.source_image}")
         return
-    configure_fast_path(paste_back=False)
+    configure_fast_path(args.source_image, paste_back=False)
     pipeline.init_vars()
     if not pipeline.prepare_source(args.source_image):
         print(f"warning: failed to prepare source image: {args.source_image}")
     voices = list_voices()
     if voices:
         try:
-            pipeline.get_kokoro_pipeline(voices[0])
+            pipeline.get_kokoro_pipeline(default_voice_for(voices))
         except Exception as exc:
             print(f"warning: failed to prewarm Kokoro: {exc}")
 
 
-def animate(text, voice_name, paste_back, cfg_scale, driving_multiplier, frame_step):
+def selected_output_mode(output_mode):
+    return output_mode == "Full Image"
+
+
+def animate(
+        source_image,
+        text,
+        voice_name,
+        output_mode,
+        cfg_scale,
+        driving_multiplier,
+        frame_step,
+        flag_relative_motion,
+        flag_do_crop,
+        flag_stitching,
+        animation_region,
+        src_scale,
+        src_vx_ratio,
+        src_vy_ratio,
+        driving_smooth_observation_variance,
+):
     text = (text or "").strip()
     if not text:
         raise gr.Error("Enter text first.")
-    if not os.path.exists(args.source_image):
-        raise gr.Error(f"Missing source image: {args.source_image}")
+    if not source_image:
+        raise gr.Error("Choose, upload, or capture a source image first.")
+    source_path = str(source_image)
+    if not os.path.exists(source_path):
+        raise gr.Error(f"Missing source image: {source_path}")
 
     started = time.perf_counter()
+    paste_back = selected_output_mode(output_mode)
+    if paste_back and (not flag_do_crop or not flag_stitching):
+        raise gr.Error("Full Image output requires Do Crop and Stitching.")
     update_ret = configure_fast_path(
+        source_path,
         paste_back=paste_back,
         cfg_scale=cfg_scale,
         driving_multiplier=driving_multiplier,
+        flag_relative_motion=flag_relative_motion,
+        flag_do_crop=flag_do_crop,
+        flag_stitching=flag_stitching,
+        animation_region=animation_region,
+        src_scale=src_scale,
+        src_vx_ratio=src_vx_ratio,
+        src_vy_ratio=src_vy_ratio,
+        driving_smooth_observation_variance=driving_smooth_observation_variance,
     )
     video_path, crop_path, _pipeline_time, timings = pipeline.run_text_driving_profiled(
         text,
         voice_name,
-        args.source_image,
+        source_path,
         update_ret=update_ret,
         mux_full_audio=paste_back,
         render_full_video=paste_back,
@@ -164,26 +249,35 @@ def format_timings(timings):
 
 
 css = """
-.mona-shell {max-width: 1180px; margin: 0 auto;}
+.text-animation-shell {max-width: 1240px; margin: 0 auto;}
 .metric input {font-size: 26px !important; font-weight: 700 !important;}
 .compact-preview img {object-fit: cover;}
 """
 
 prewarm()
 voices = list_voices()
-default_voice = "af_heart" if "af_heart" in voices else voices[0]
+default_voice = default_voice_for(voices)
+source_examples = list_source_examples()
+default_source = args.source_image if os.path.exists(args.source_image) else None
 
 with gr.Blocks(theme=gr.themes.Soft(font=[gr.themes.GoogleFont("Plus Jakarta Sans")]), css=css) as demo:
-    with gr.Column(elem_classes=["mona-shell"]):
-        gr.Markdown("# Mona Lisa Text To Video")
+    with gr.Column(elem_classes=["text-animation-shell"]):
+        gr.Markdown("# Text To Animation")
         with gr.Row():
             with gr.Column(scale=1, min_width=280):
-                gr.Image(
-                    value=args.source_image if os.path.exists(args.source_image) else None,
-                    label="Mona Lisa",
-                    interactive=False,
+                source_image_input = gr.Image(
+                    value=default_source,
+                    label="Source Image",
+                    type="filepath",
+                    sources=["upload", "webcam", "clipboard"],
+                    interactive=True,
                     height=460,
                     elem_classes=["compact-preview"],
+                )
+                gr.Examples(
+                    examples=source_examples,
+                    inputs=[source_image_input],
+                    cache_examples=False,
                 )
                 elapsed_output = gr.Textbox(
                     value="",
@@ -199,7 +293,7 @@ with gr.Blocks(theme=gr.themes.Soft(font=[gr.themes.GoogleFont("Plus Jakarta San
                 )
             with gr.Column(scale=2, min_width=420):
                 text_input = gr.Textbox(
-                    value="Hello. I am Mona Lisa, animated by Faster LivePortrait.",
+                    value="Hello. I am animated by Faster LivePortrait.",
                     label="Text",
                     lines=5,
                 )
@@ -211,9 +305,9 @@ with gr.Blocks(theme=gr.themes.Soft(font=[gr.themes.GoogleFont("Plus Jakarta San
                     )
                     cfg_scale_input = gr.Slider(
                         minimum=0.0,
-                        maximum=6.0,
-                        value=1.2,
-                        step=0.1,
+                        maximum=10.0,
+                        value=4.0,
+                        step=0.5,
                         label="CFG Scale",
                     )
                     driving_multiplier_input = gr.Slider(
@@ -226,23 +320,76 @@ with gr.Blocks(theme=gr.themes.Soft(font=[gr.themes.GoogleFont("Plus Jakarta San
                     frame_step_input = gr.Slider(
                         minimum=1,
                         maximum=4,
-                        value=2,
+                        value=1,
                         step=1,
                         label="Frame Step",
                     )
-                paste_back_input = gr.Checkbox(value=False, label="Full Painting")
+                with gr.Row():
+                    output_mode_input = gr.Radio(
+                        choices=["Crop Only", "Full Image"],
+                        value="Full Image",
+                        label="Output",
+                    )
+                    flag_relative_input = gr.Checkbox(value=False, label="Relative Motion")
+                    flag_stitching_input = gr.Checkbox(value=True, label="Stitching")
+                    animation_region_input = gr.Radio(
+                        choices=["exp", "pose", "lip", "eyes", "all"],
+                        value="all",
+                        label="Animation Region",
+                    )
+                with gr.Accordion(open=True, label="Cropping Options"):
+                    with gr.Row():
+                        flag_do_crop_input = gr.Checkbox(value=True, label="Do Crop")
+                        src_scale_input = gr.Number(
+                            value=2.3,
+                            label="Crop Scale",
+                            minimum=1.8,
+                            maximum=3.2,
+                            step=0.05,
+                        )
+                        src_vx_ratio_input = gr.Number(
+                            value=0.0,
+                            label="Crop X",
+                            minimum=-0.5,
+                            maximum=0.5,
+                            step=0.01,
+                        )
+                        src_vy_ratio_input = gr.Number(
+                            value=-0.125,
+                            label="Crop Y",
+                            minimum=-0.5,
+                            maximum=0.5,
+                            step=0.01,
+                        )
+                with gr.Accordion(open=False, label="Advanced Animation Options"):
+                    driving_smooth_input = gr.Number(
+                        value=1e-7,
+                        label="Motion Smooth Strength",
+                        minimum=1e-11,
+                        maximum=1e-2,
+                        step=1e-8,
+                    )
                 run_button = gr.Button("Generate", variant="primary")
                 video_output = gr.Video(label="Video", autoplay=True)
 
     run_button.click(
         fn=animate,
         inputs=[
+            source_image_input,
             text_input,
             voice_input,
-            paste_back_input,
+            output_mode_input,
             cfg_scale_input,
             driving_multiplier_input,
             frame_step_input,
+            flag_relative_input,
+            flag_do_crop_input,
+            flag_stitching_input,
+            animation_region_input,
+            src_scale_input,
+            src_vx_ratio_input,
+            src_vy_ratio_input,
+            driving_smooth_input,
         ],
         outputs=[video_output, elapsed_output, timings_output],
         show_progress=True,
