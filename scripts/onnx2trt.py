@@ -31,13 +31,28 @@ logging.getLogger("EngineBuilder").setLevel(logging.INFO)
 log = logging.getLogger("EngineBuilder")
 
 
+def find_plugin_path():
+    candidates = [
+        os.environ.get("FLP_TRT_PLUGIN_PATH"),
+        "./checkpoints/liveportrait_onnx/libgrid_sample_3d_plugin.so",
+        "/opt/fasterliveportrait/plugins/libgrid_sample_3d_plugin.so",
+    ]
+    for path in candidates:
+        if path and os.path.exists(path):
+            return path
+    raise FileNotFoundError(
+        "TensorRT grid_sample plugin not found. Set FLP_TRT_PLUGIN_PATH or build "
+        "checkpoints/liveportrait_onnx/libgrid_sample_3d_plugin.so."
+    )
+
+
 def load_plugins(logger: trt.Logger):
-    # 加载插件库
     if platform.system().lower() == 'linux':
-        ctypes.CDLL("./checkpoints/liveportrait_onnx/libgrid_sample_3d_plugin.so", mode=ctypes.RTLD_GLOBAL)
+        plugin_path = find_plugin_path()
+        log.info("Loading TensorRT plugin: %s", plugin_path)
+        ctypes.CDLL(plugin_path, mode=ctypes.RTLD_GLOBAL)
     else:
         ctypes.CDLL("./checkpoints/liveportrait_onnx/grid_sample_3d_plugin.dll", mode=ctypes.RTLD_GLOBAL, winmode=0)
-    # 初始化TensorRT的插件库
     trt.init_libnvinfer_plugins(logger, "")
 
 
@@ -58,7 +73,11 @@ class EngineBuilder:
 
         self.builder = trt.Builder(self.trt_logger)
         self.config = self.builder.create_builder_config()
-        self.config.max_workspace_size = 12 * (2 ** 30)  # 12 GB
+        workspace_size = 12 * (2 ** 30)  # 12 GB
+        if hasattr(self.config, "set_memory_pool_limit"):
+            self.config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_size)
+        else:
+            self.config.max_workspace_size = workspace_size
 
         profile = self.builder.create_optimization_profile()
 
@@ -68,8 +87,10 @@ class EngineBuilder:
         # profile.set_shape("input.1", (1, 3, 512, 512), (1, 3, 512, 512), (1, 3, 512, 512))
 
         self.config.add_optimization_profile(profile)
-        # 严格类型约束
-        self.config.set_flag(trt.BuilderFlag.STRICT_TYPES)
+        if hasattr(trt.BuilderFlag, "STRICT_TYPES"):
+            self.config.set_flag(trt.BuilderFlag.STRICT_TYPES)
+        elif hasattr(trt.BuilderFlag, "OBEY_PRECISION_CONSTRAINTS"):
+            self.config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
 
         self.batch_size = None
         self.network = None
@@ -106,7 +127,8 @@ class EngineBuilder:
         for output in outputs:
             log.info("Output '{}' with shape {} and dtype {}".format(output.name, output.shape, output.dtype))
         # assert self.batch_size > 0
-        self.builder.max_batch_size = 1
+        if hasattr(self.builder, "max_batch_size"):
+            self.builder.max_batch_size = 1
 
     def create_engine(
             self,
@@ -129,9 +151,18 @@ class EngineBuilder:
             else:
                 self.config.set_flag(trt.BuilderFlag.FP16)
 
-        with self.builder.build_engine(self.network, self.config) as engine, open(engine_path, "wb") as f:
-            log.info("Serializing engine to file: {:}".format(engine_path))
-            f.write(engine.serialize())
+        log.info("Serializing engine to file: {:}".format(engine_path))
+        if hasattr(self.builder, "build_serialized_network"):
+            serialized_engine = self.builder.build_serialized_network(self.network, self.config)
+            if serialized_engine is None:
+                raise RuntimeError("TensorRT failed to build serialized engine")
+            with open(engine_path, "wb") as f:
+                f.write(serialized_engine)
+        else:
+            with self.builder.build_engine(self.network, self.config) as engine, open(engine_path, "wb") as f:
+                if engine is None:
+                    raise RuntimeError("TensorRT failed to build engine")
+                f.write(engine.serialize())
 
 
 def main(args):

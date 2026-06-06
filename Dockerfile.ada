@@ -1,126 +1,81 @@
 # syntax=docker/dockerfile:1
-# ──────────────────────────────────────────────────────────────────────────────
-# Stage 1: Build custom onnxruntime with CUDA grid_sample support
 #
-# Builder uses Ubuntu 22.04 so we can install cuDNN 8 from NVIDIA's apt repo.
-# onnxruntime v1.17 (liqun branch) calls cuDNN 8 RNN APIs removed in cuDNN 9.
-# Targets sm_89 (Ada Lovelace / RTX 4070 laptop).
-# Runtime uses Ubuntu 22.04 to match the cp310 wheel from the builder.
-# ──────────────────────────────────────────────────────────────────────────────
-FROM nvidia/cuda:12.8.1-devel-ubuntu22.04 AS ort-builder
+# TensorRT runtime for Ada Lovelace GPUs such as RTX 40-series.
+# The previous ONNX-focused Dockerfile is kept as Dockerfile.ada.onnx.
 
-ENV DEBIAN_FRONTEND=noninteractive
-ARG ORT_BUILD_PARALLELISM=2
+ARG TRT_BASE=nvcr.io/nvidia/tensorrt:24.12-py3
 ARG CUDA_ARCHITECTURES=89
-ENV CMAKE_BUILD_PARALLEL_LEVEL=${ORT_BUILD_PARALLELISM} \
-    MAX_JOBS=${ORT_BUILD_PARALLELISM}
+ARG PLUGIN_BUILD_PARALLELISM=4
+ARG TENSORRT_ROOT=/usr
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-dev python3-pip python3-venv \
-    git ninja-build build-essential wget
+FROM ${TRT_BASE} AS plugin-builder
 
-# Install cuDNN 8 from NVIDIA's apt repo (8.9.7 is the last 8.x, compatible
-# with CUDA 12.x despite the +cuda12.2 label in the package version).
-RUN wget -qO /tmp/cuda-keyring.deb \
-        https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb && \
-    dpkg -i /tmp/cuda-keyring.deb && \
-    rm /tmp/cuda-keyring.deb && \
-    apt-get update && \
-    apt-get install -y libcudnn8 libcudnn8-dev
+ARG CUDA_ARCHITECTURES
+ARG PLUGIN_BUILD_PARALLELISM
+ARG TENSORRT_ROOT
+ENV DEBIAN_FRONTEND=noninteractive
 
-# Symlink cuDNN into cuda_home so onnxruntime's --cudnn_home /usr/local/cuda works
-RUN ln -sf /usr/include/cudnn*.h /usr/local/cuda/include/ 2>/dev/null || true && \
-    ln -sf /usr/lib/x86_64-linux-gnu/libcudnn* /usr/local/cuda/lib64/ 2>/dev/null || true
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake git
 
-# Use a venv to avoid system-pip conflicts
-RUN python3 -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
+RUN git clone --depth 1 https://github.com/SeanWangJS/grid-sample3d-trt-plugin \
+    /opt/grid-sample3d-trt-plugin
 
-# Pin to cmake 3.29 — cmake 4.x breaks FetchContent deps with old
-# cmake_minimum_required declarations.
-RUN pip install --upgrade pip setuptools wheel "cmake==3.29.6" numpy
+WORKDIR /opt/grid-sample3d-trt-plugin
 
-RUN git clone --branch liqun/ImageDecoder-cuda --depth 1 \
-    https://github.com/microsoft/onnxruntime /onnxruntime
+RUN cmake -S . -B build \
+      -DTensorRT_ROOT="${TENSORRT_ROOT}" \
+      -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES}" && \
+    cmake --build build --parallel "${PLUGIN_BUILD_PARALLELISM}" && \
+    mkdir -p /opt/fasterliveportrait/plugins && \
+    cp "$(find build -name libgrid_sample_3d_plugin.so -print -quit)" \
+      /opt/fasterliveportrait/plugins/libgrid_sample_3d_plugin.so
 
-WORKDIR /onnxruntime
-
-# Pre-clone Eigen at the exact commit onnxruntime expects so FetchContent
-# skips the download+hash step entirely (GitLab's zip hash changed).
-RUN git clone https://gitlab.com/libeigen/eigen.git /tmp/eigen-src && \
-    git -C /tmp/eigen-src checkout e7248b26a1ed53fa030c5c459f7ea095dfd276ac
-
-# moe_kernel.cu uses FLT_MAX but omits <cfloat> — known upstream bug (microsoft/onnxruntime#20953).
-RUN sed -i '1s/^/#include <cfloat>\n/' \
-    onnxruntime/contrib_ops/cuda/moe/ft_moe/moe_kernel.cu
-
-# Wheel is copied out with its original filename so pip accepts it.
-RUN ./build.sh \
-    --cmake_path /opt/venv/bin/cmake \
-    --build_shared_lib \
-    --use_cuda \
-    --cuda_version 12.8 \
-    --cuda_home /usr/local/cuda \
-    --cudnn_home /usr/local/cuda \
-    --config Release \
-    --build_wheel \
-    --skip_tests \
-    --cmake_extra_defines CMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES}" \
-    --cmake_extra_defines CMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
-    --cmake_extra_defines FETCHCONTENT_SOURCE_DIR_EIGEN=/tmp/eigen-src \
-    --disable_contrib_ops \
-    --compile_no_warning_as_error \
-    --parallel ${ORT_BUILD_PARALLELISM} \
-    --allow_running_as_root && \
-    mkdir -p /opt/ort && \
-    cp /onnxruntime/build/Linux/Release/dist/onnxruntime_gpu*.whl /opt/ort/
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Stage 2: Runtime image — Ubuntu 22.04 + CUDA 12.8 gives Python 3.10, matching
-# the cp310 wheel built in the ort-builder stage.
-# ──────────────────────────────────────────────────────────────────────────────
-FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04 AS runtime
+FROM ${TRT_BASE} AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-dev python3-venv \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+    python3-dev python3-venv \
     espeak-ng espeak-ng-data ffmpeg libgl1 libglib2.0-0 libsm6 libxext6 \
-    git wget
+    git wget && \
+    rm -rf /var/lib/apt/lists/*
 
-# The custom onnxruntime wheel is built against cuDNN 8. CUDA 12.8 cuDNN base
-# images provide newer cuDNN, so install the runtime library it links to.
-RUN wget -qO /tmp/cuda-keyring.deb \
-        https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb && \
-    dpkg -i /tmp/cuda-keyring.deb && \
-    rm /tmp/cuda-keyring.deb && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends libcudnn8 && \
-    (ln -sf /usr/lib/x86_64-linux-gnu/libcudnn* /usr/local/cuda/lib64/ 2>/dev/null || true)
+RUN python3 -m venv --system-site-packages /opt/venv
 
-RUN python3 -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
-ENV PHONEMIZER_ESPEAK_DATA=/usr/lib/x86_64-linux-gnu/espeak-ng-data \
+ENV PATH="/opt/venv/bin:$PATH" \
+    FLP_TRT_PLUGIN_PATH=/opt/fasterliveportrait/plugins/libgrid_sample_3d_plugin.so \
+    PHONEMIZER_ESPEAK_DATA=/usr/lib/x86_64-linux-gnu/espeak-ng-data \
     ESPEAK_DATA_PATH=/usr/lib/x86_64-linux-gnu/espeak-ng-data \
     ESPEAKNG_DATA_PATH=/usr/lib/x86_64-linux-gnu/espeak-ng-data
 
-RUN pip install --upgrade pip
+COPY --from=plugin-builder /opt/fasterliveportrait/plugins /opt/fasterliveportrait/plugins
 
-RUN pip install torch torchvision torchaudio \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --upgrade pip setuptools wheel
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install torch torchvision torchaudio \
     --index-url https://download.pytorch.org/whl/cu128
 
-COPY --from=ort-builder /opt/ort /opt/ort
-
-WORKDIR /app
+WORKDIR /root/FasterLivePortrait
 COPY requirements.txt .
-RUN pip install -r requirements.txt
 
-# Force-reinstall our custom onnxruntime, overriding any stock version that
-# insightface or another transitive dep may have pulled in above
-RUN pip uninstall -y onnxruntime onnxruntime-gpu || true && \
-    pip install --force-reinstall /opt/ort/*.whl && \
-    python3 -c 'import onnxruntime as ort; providers = ort.get_available_providers(); print("ONNX Runtime providers:", providers); assert "CUDAExecutionProvider" in providers, providers' && \
-    rm -rf /opt/ort
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --prefer-binary pycuda
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --prefer-binary insightface
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --prefer-binary -r requirements.txt
+
+RUN python3 -c 'import tensorrt as trt; import pycuda; import torch; print("TensorRT:", trt.__version__); print("Torch CUDA:", torch.version.cuda)' && \
+    test -f "${FLP_TRT_PLUGIN_PATH}"
 
 COPY . .
 
@@ -129,5 +84,4 @@ ENV FLIP_PORT=9871
 
 EXPOSE 9870 9871
 
-# Default: Gradio web UI in ONNX mode, bound to all interfaces
-CMD ["python3", "webui.py", "--mode", "onnx", "--host_ip", "0.0.0.0", "--port", "9870"]
+CMD ["python3", "webui.py", "--mode", "trt", "--host_ip", "0.0.0.0", "--port", "9870"]

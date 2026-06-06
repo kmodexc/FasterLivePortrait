@@ -44,17 +44,29 @@ class TensorRTPredictor:
         """
         :param engine_path: The path to the serialized engine to load from disk.
         """
+        self.engine = None
+        self.context = None
+        self.inputs = []
+        self.outputs = []
+        self.tensors = OrderedDict()
+        engine_path = kwargs.get("model_path", None)
+        self.debug = kwargs.get("debug", False)
+        if not engine_path or not os.path.exists(engine_path):
+            raise FileNotFoundError(
+                f"TensorRT engine not found: {engine_path}. Build engines first with "
+                "`sh scripts/all_onnx2trt.sh` inside the TensorRT container."
+            )
+
         if platform.system().lower() == 'linux':
-            ctypes.CDLL("./checkpoints/liveportrait_onnx/libgrid_sample_3d_plugin.so", mode=ctypes.RTLD_GLOBAL)
+            plugin_path = self.find_plugin_path()
+            print(f"Loading TensorRT plugin: {plugin_path}")
+            ctypes.CDLL(plugin_path, mode=ctypes.RTLD_GLOBAL)
         else:
             ctypes.CDLL("./checkpoints/liveportrait_onnx/grid_sample_3d_plugin.dll", mode=ctypes.RTLD_GLOBAL,
                         winmode=0)
         # Load TRT engine
         self.logger = trt.Logger(trt.Logger.ERROR)
         trt.init_libnvinfer_plugins(self.logger, "")
-        engine_path = kwargs.get("model_path", None)
-        self.debug = kwargs.get("debug", False)
-        assert engine_path, f"model:{engine_path} must exist!"
         with open(engine_path, "rb") as f, trt.Runtime(self.logger) as runtime:
             assert runtime
             self.engine = runtime.deserialize_cuda_engine(f.read())
@@ -63,16 +75,12 @@ class TensorRTPredictor:
         assert self.context
 
         # Setup I/O bindings
-        self.inputs = []
-        self.outputs = []
-        self.tensors = OrderedDict()
-
         # TODO: 支持动态shape输入
-        for idx in range(self.engine.num_io_tensors):
-            name = self.engine[idx]
-            is_input = self.engine.get_tensor_mode(name).name == "INPUT"
-            shape = self.engine.get_tensor_shape(name)
-            dtype = trt.nptype(self.engine.get_tensor_dtype(name))
+        for idx in range(self.num_tensors()):
+            name = self.tensor_name(idx)
+            is_input = self.is_input_tensor(name, idx)
+            shape = self.tensor_shape(name, idx)
+            dtype = trt.nptype(self.tensor_dtype(name, idx))
 
             binding = {
                 "index": idx,
@@ -89,21 +97,62 @@ class TensorRTPredictor:
         assert len(self.outputs) > 0
         self.allocate_max_buffers()
 
+    @staticmethod
+    def find_plugin_path():
+        candidates = [
+            os.environ.get("FLP_TRT_PLUGIN_PATH"),
+            "./checkpoints/liveportrait_onnx/libgrid_sample_3d_plugin.so",
+            "/opt/fasterliveportrait/plugins/libgrid_sample_3d_plugin.so",
+        ]
+        for path in candidates:
+            if path and os.path.exists(path):
+                return path
+        raise FileNotFoundError(
+            "TensorRT grid_sample plugin not found. Set FLP_TRT_PLUGIN_PATH or build "
+            "checkpoints/liveportrait_onnx/libgrid_sample_3d_plugin.so."
+        )
+
+    def num_tensors(self):
+        return self.engine.num_io_tensors if hasattr(self.engine, "num_io_tensors") else self.engine.num_bindings
+
+    def tensor_name(self, idx):
+        if hasattr(self.engine, "get_tensor_name"):
+            return self.engine.get_tensor_name(idx)
+        return self.engine[idx]
+
+    def is_input_tensor(self, name, idx):
+        if hasattr(self.engine, "get_tensor_mode"):
+            return self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT
+        return self.engine.binding_is_input(idx)
+
+    def tensor_shape(self, name, idx):
+        if hasattr(self.engine, "get_tensor_shape"):
+            return self.engine.get_tensor_shape(name)
+        return self.engine.get_binding_shape(idx)
+
+    def tensor_dtype(self, name, idx):
+        if hasattr(self.engine, "get_tensor_dtype"):
+            return self.engine.get_tensor_dtype(name)
+        return self.engine.get_binding_dtype(idx)
+
     def allocate_max_buffers(self, device="cuda"):
         nvtx.range_push("allocate_max_buffers")
         # 目前仅支持 batch 维度的动态处理
         batch_size = 1
-        for idx in range(self.engine.num_io_tensors):
-            binding = self.engine[idx]
-            shape = self.engine.get_tensor_shape(binding)
-            is_input = self.engine.get_tensor_mode(binding).name == "INPUT"
+        for idx in range(self.num_tensors()):
+            binding = self.tensor_name(idx)
+            shape = list(self.tensor_shape(binding, idx))
+            is_input = self.is_input_tensor(binding, idx)
             if -1 in shape:
                 if is_input:
-                    shape = self.engine.get_tensor_profile_shape(binding, 0)[-1]
+                    if hasattr(self.engine, "get_tensor_profile_shape"):
+                        shape = list(self.engine.get_tensor_profile_shape(binding, 0)[-1])
+                    else:
+                        shape = list(self.engine.get_profile_shape(0, binding)[-1])
                     batch_size = shape[0]
                 else:
                     shape[0] = batch_size
-            dtype = trt.nptype(self.engine.get_tensor_dtype(binding))
+            dtype = trt.nptype(self.tensor_dtype(binding, idx))
             tensor = torch.empty(
                 tuple(shape), dtype=numpy_to_torch_dtype_dict[dtype]
             ).to(device=device)
@@ -163,11 +212,9 @@ class TensorRTPredictor:
         return self.tensors
 
     def __del__(self):
-        del self.engine
-        del self.context
-        del self.inputs
-        del self.outputs
-        del self.tensors
+        for attr in ("engine", "context", "inputs", "outputs", "tensors"):
+            if hasattr(self, attr):
+                delattr(self, attr)
 
 
 class OnnxRuntimePredictor:

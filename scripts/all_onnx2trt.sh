@@ -1,4 +1,5 @@
 #!/bin/bash
+set -e
 
 # warping+spade model
 python scripts/onnx2trt.py -o ./checkpoints/liveportrait_onnx/warping_spade-fix.onnx

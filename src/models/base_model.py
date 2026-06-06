@@ -10,6 +10,7 @@ class BaseModel:
 
     def __init__(self, **kwargs):
         self.kwargs = copy.deepcopy(kwargs)
+        self.predictor = None
         self.predictor = get_predictor(**self.kwargs)
         self.device = torch.cuda.current_device()
         self.cudaStream = torch.cuda.current_stream().cuda_stream
@@ -45,5 +46,5 @@ class BaseModel:
         删除实例
         :return:
         """
-        if self.predictor is not None:
+        if getattr(self, "predictor", None) is not None:
             del self.predictor
