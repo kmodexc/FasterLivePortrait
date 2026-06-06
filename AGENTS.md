@@ -3,7 +3,7 @@
 ## Project
 
 This repository is `FasterLivePortrait`. The current working focus is making
-Gradio text-driven animation work in Docker with ONNX mode:
+Gradio text-driven animation work in Docker with ONNX and TensorRT modes:
 
 ```bash
 docker run -it --gpus=all --rm \
@@ -26,9 +26,10 @@ Main changes in that commit:
 
 - Added `.dockerignore` to keep checkpoints, results, caches, and build output
   out of Docker build context.
-- Updated `Dockerfile.ada` and `Dockerfile.blackwell` for CUDA 12.8 runtime
-  compatibility, custom ONNX Runtime wheel handling, cuDNN 8 runtime install,
-  eSpeak packages/data env vars, and build parallelism controls.
+- Updated the then-current `Dockerfile.ada` and `Dockerfile.blackwell` for
+  CUDA 12.8 runtime compatibility, custom ONNX Runtime wheel handling, cuDNN 8
+  runtime install, eSpeak packages/data env vars, and build parallelism
+  controls.
 - Added optional `FLP_PROFILE=1` frame timing in
   `src/pipelines/faster_live_portrait_pipeline.py` and
   `src/pipelines/gradio_live_portrait_pipeline.py`.
@@ -41,8 +42,24 @@ Main changes in that commit:
 - Set JoyVASA Transformers audio encoders to `attn_implementation="eager"` in
   `src/models/JoyVASA/dit_talking_head.py`.
 
-Current uncommitted local change seen after that commit: `.gitignore` includes
-`.hf-download-venv/`.
+Current uncommitted local changes after that commit include:
+
+- `.gitignore` includes `.hf-download-venv/`.
+- ONNX Dockerfiles were renamed to:
+  - `Dockerfile.ada.onnx`
+  - `Dockerfile.blackwell.onnx`
+- New TensorRT Dockerfiles now live at:
+  - `Dockerfile.ada`
+  - `Dockerfile.blackwell`
+- TensorRT conversion/runtime compatibility patches were added in:
+  - `scripts/onnx2trt.py`
+  - `src/models/predictor.py`
+  - `src/models/base_model.py`
+  - `src/models/motion_extractor_model.py`
+- TensorRT animal v1.1 paths were corrected in:
+  - `scripts/all_onnx2trt_animal.sh`
+  - `configs/trt_infer.yaml`
+  - `configs/trt_mp_infer.yaml`
 
 ## Text-To-Animation Fixes Applied
 
@@ -120,7 +137,7 @@ Measured user run in ONNX mode on an RTX 4070 Laptop GPU at 100 W:
   `warping_spade`; GPU utilization was 99% and power was 100/100 W, so this was
   not an idle GPU or obvious CPU fallback case.
 
-Current conclusion:
+ONNX performance conclusion:
 
 - In ONNX mode the practical bottleneck is the LivePortrait `warping_spade`
   model, specifically the grid-sample-heavy path.
@@ -131,15 +148,69 @@ Current conclusion:
   execute on the GPU but slowly.
 - The README's TensorRT recommendation still looks correct for real-time
   performance. The repo claims 30+ FPS on an RTX 3090 with TensorRT.
-- Local checkpoint tree currently contains ONNX files but no `.trt` engines.
 
-Recommended next performance step:
+## TensorRT Docker Status
+
+Docker is still not available inside this Codex workspace, so image build,
+engine conversion, and GPU verification must be done by the user on the host.
+
+The user successfully built the Ada TensorRT image as `flp` from
+`Dockerfile.ada`. The image is based on NVIDIA TensorRT 24.12 / TensorRT 10.7.
+
+The first build failure was:
+
+- `ImportError: libcuda.so.1` during `docker build` when importing
+  `pycuda.driver`.
+
+Fix applied:
+
+- `Dockerfile.ada` and `Dockerfile.blackwell` now import `pycuda` instead of
+  `pycuda.driver` during build. `pycuda.driver` can only be imported at
+  container runtime with `--gpus=all`, because `libcuda.so.1` is provided by the
+  host NVIDIA driver.
+
+The TRT Dockerfiles:
+
+- Build the `grid_sample_3d` TensorRT plugin inside the image.
+- Copy it to `/opt/fasterliveportrait/plugins/libgrid_sample_3d_plugin.so`.
+- Set `FLP_TRT_PLUGIN_PATH` to that copied plugin.
+- Use `python3 -m venv --system-site-packages /opt/venv` so NVIDIA's system
+  TensorRT Python bindings are visible inside the venv.
+- Default to `webui.py --mode trt`.
+
+`scripts/onnx2trt.py` and `src/models/predictor.py` now search for the plugin
+in this order:
+
+1. `$FLP_TRT_PLUGIN_PATH`
+2. `./checkpoints/liveportrait_onnx/libgrid_sample_3d_plugin.so`
+3. `/opt/fasterliveportrait/plugins/libgrid_sample_3d_plugin.so`
+
+TensorRT 10 compatibility patches:
+
+- `scripts/onnx2trt.py` supports `set_memory_pool_limit()` and
+  `build_serialized_network()` while still keeping fallback paths for older TRT.
+- `src/models/predictor.py` supports newer tensor APIs such as
+  `num_io_tensors`, `get_tensor_name()`, and `get_tensor_mode()`.
+- `TensorRTPredictor` now checks for missing `.trt` engines before loading the
+  plugin/runtime and raises a clear `FileNotFoundError`.
+- `BaseModel.__del__` and `TensorRTPredictor.__del__` tolerate partial
+  initialization to avoid cleanup-time traceback noise.
+
+TensorRT engines must be generated once before running `--mode trt`:
 
 ```bash
 docker run -it --gpus=all --rm \
   -v "$PWD":/root/FasterLivePortrait \
   -w /root/FasterLivePortrait \
   flp sh scripts/all_onnx2trt.sh
+```
+
+This creates files such as:
+
+```text
+checkpoints/liveportrait_onnx/warping_spade-fix.trt
+checkpoints/liveportrait_onnx/motion_extractor.trt
+checkpoints/liveportrait_onnx/appearance_feature_extractor.trt
 ```
 
 Then run the Mona app with TensorRT:
@@ -152,10 +223,32 @@ docker run -it --gpus=all --rm \
   flp python3 mona_lisa_webui.py --mode trt --host_ip 0.0.0.0 --port 9871
 ```
 
-If trying TensorRT on Blackwell/RTX 50-series hardware, prefer the existing
-`Dockerfile.blackwell` path if the current image/tooling cannot build/load TRT
-engines. The `grid_sample_3d` TensorRT plugin must load successfully, and
-`warping_spade-fix.trt` is the key engine for this bottleneck.
+The user ran TRT mode after building engines and hit a source-prep crash:
+
+```text
+ValueError: cannot reshape array of size 1 into shape (1,newaxis,3)
+```
+
+Root cause:
+
+- `MotionExtractorModel.output_process()` assumed legacy TRT output order:
+  `kp, pitch, yaw, roll, t, exp, scale`.
+- The TensorRT 10 engine exposed ONNX output order:
+  `pitch, yaw, roll, t, exp, scale, kp`.
+
+Fix applied:
+
+- `src/models/motion_extractor_model.py` now accepts both orders by checking
+  the first output shape. If the first TRT output has shape like `(B, 66)`, it
+  treats outputs as ONNX order; otherwise it keeps the legacy TRT order.
+
+No engine rebuild should be needed for that fix because Python source is
+bind-mounted into the container.
+
+If trying TensorRT on Blackwell/RTX 50-series hardware, use
+`Dockerfile.blackwell` and expect the plugin/engine build to be hardware and
+driver sensitive. The `grid_sample_3d` TensorRT plugin must load successfully,
+and `warping_spade-fix.trt` is the key engine for this bottleneck.
 
 ## Required Checkpoints
 
@@ -171,6 +264,9 @@ Kokoro is expected at `checkpoints/Kokoro-82M` and LivePortrait ONNX models at
 
 Large checkpoint directories are ignored by git and should not be committed.
 
+LivePortrait TRT engines are generated files under checkpoint directories and
+should also remain uncommitted.
+
 ## Verification Commands
 
 Use syntax checks with an alternate pycache location because repo pycache dirs
@@ -182,6 +278,9 @@ PYTHONPYCACHEPREFIX=/tmp/flp-pycache python3 -m py_compile \
   src/pipelines/gradio_live_portrait_pipeline.py \
   src/pipelines/faster_live_portrait_pipeline.py \
   src/pipelines/joyvasa_audio_to_motion_pipeline.py \
+  src/models/base_model.py \
+  src/models/predictor.py \
+  src/models/motion_extractor_model.py \
   src/models/JoyVASA/dit_talking_head.py \
   src/models/JoyVASA/hubert.py \
   src/models/JoyVASA/wav2vec2.py
