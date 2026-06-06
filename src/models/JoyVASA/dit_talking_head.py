@@ -79,7 +79,7 @@ class DitTalkingHead(nn.Module):
         if self.audio_model == 'wav2vec2':
             print("using wav2vec2 audio encoder ...")
             from .wav2vec2 import Wav2Vec2Model
-            self.audio_encoder = Wav2Vec2Model.from_pretrained(audio_encoder_path)
+            self.audio_encoder = Wav2Vec2Model.from_pretrained(audio_encoder_path, attn_implementation="eager")
             # wav2vec 2.0 weights initialization
             self.audio_encoder.feature_extractor._freeze_parameters()
 
@@ -93,13 +93,13 @@ class DitTalkingHead(nn.Module):
                         param.requires_grad = False
         elif self.audio_model == "wav2vec2_ori":
             from .wav2vec2 import Wav2Vec2Model
-            self.audio_encoder = Wav2Vec2Model.from_pretrained(audio_encoder_path)
+            self.audio_encoder = Wav2Vec2Model.from_pretrained(audio_encoder_path, attn_implementation="eager")
             # wav2vec 2.0 weights initialization
             self.audio_encoder.feature_extractor._freeze_parameters()
         elif self.audio_model == 'hubert':  # 根据经验，hubert特征提取器效果更好
             from .hubert import HubertModel
             # from hubert import HubertModel
-            self.audio_encoder = HubertModel.from_pretrained(audio_encoder_path)
+            self.audio_encoder = HubertModel.from_pretrained(audio_encoder_path, attn_implementation="eager")
             self.audio_encoder.feature_extractor._freeze_parameters()
             # print("hubert-en: ", self.audio_encoder)
 
@@ -115,7 +115,7 @@ class DitTalkingHead(nn.Module):
             print("using hubert chinese")
             from .hubert import HubertModel
             # from hubert import HubertModel
-            self.audio_encoder = HubertModel.from_pretrained(audio_encoder_path)
+            self.audio_encoder = HubertModel.from_pretrained(audio_encoder_path, attn_implementation="eager")
             self.audio_encoder.feature_extractor._freeze_parameters()
 
             frozen_layers = [0, 1]
@@ -129,7 +129,7 @@ class DitTalkingHead(nn.Module):
         elif self.audio_model == 'hubert_zh_ori':  # 根据经验，hubert特征提取器效果更好
             print("using hubert chinese ori")
             from .hubert import HubertModel
-            self.audio_encoder = HubertModel.from_pretrained(audio_encoder_path)
+            self.audio_encoder = HubertModel.from_pretrained(audio_encoder_path, attn_implementation="eager")
             self.audio_encoder.feature_extractor._freeze_parameters()
         else:
             raise ValueError(f'Unknown audio model {self.audio_model}!')

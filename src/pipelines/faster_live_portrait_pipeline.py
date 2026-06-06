@@ -109,6 +109,8 @@ class FasterLivePortraitPipeline:
         self.src_imgs = []
         self.is_source_video = False
         self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        self.profile_enabled = os.environ.get("FLP_PROFILE", "0") == "1"
+        self._last_profile = {}
 
     def calc_combined_eye_ratio(self, c_d_eyes_i, source_lmk):
         c_s_eyes = calc_eye_close_ratio(source_lmk[None])
@@ -308,6 +310,8 @@ class FasterLivePortraitPipeline:
 
     def _run(self, src_info, x_d_i_info, x_d_0_info, R_d_i, R_d_0, realtime, input_eye_ratio, input_lip_ratio,
              I_p_pstbk, **kwargs):
+        profile = {} if self.profile_enabled else None
+        t_geometry = time.perf_counter()
         out_crop, out_org = None, None
         eye_delta_before_animation = None
         for j in range(len(src_info)):
@@ -472,17 +476,43 @@ class FasterLivePortraitPipeline:
                     x_d_i_new = self.stitching(x_s, x_d_i_new)
 
             x_d_i_new = x_s + (x_d_i_new - x_s) * self.cfg.infer_params.driving_multiplier
+            if profile is not None:
+                profile["geometry_stitch"] = profile.get("geometry_stitch", 0.0) + (time.perf_counter() - t_geometry)
+                t_warp = time.perf_counter()
             out_crop = self.model_dict["warping_spade"].predict(f_s, x_s, x_d_i_new)
+            if profile is not None:
+                profile["warping_spade"] = profile.get("warping_spade", 0.0) + (time.perf_counter() - t_warp)
             if not realtime and self.cfg.infer_params.flag_pasteback and self.cfg.infer_params.flag_do_crop and self.cfg.infer_params.flag_stitching:
                 # TODO: pasteback is slow, considering optimize it using multi-threading or GPU
                 # I_p_pstbk = paste_back(out_crop, crop_info['M_c2o'], I_p_pstbk, mask_ori_float)
+                if profile is not None:
+                    t_pasteback = time.perf_counter()
                 I_p_pstbk = paste_back_pytorch(out_crop, M, I_p_pstbk, mask_ori_float)
-        return out_crop.to(dtype=torch.uint8).cpu().numpy(), I_p_pstbk.to(dtype=torch.uint8).cpu().numpy()
+                if profile is not None:
+                    profile["pasteback"] = profile.get("pasteback", 0.0) + (time.perf_counter() - t_pasteback)
+            if profile is not None:
+                t_geometry = time.perf_counter()
+        if profile is not None:
+            t_to_numpy = time.perf_counter()
+        result = out_crop.to(dtype=torch.uint8).cpu().numpy(), I_p_pstbk.to(dtype=torch.uint8).cpu().numpy()
+        if profile is not None:
+            profile["to_numpy"] = time.perf_counter() - t_to_numpy
+            self._last_profile.update(profile)
+        return result
 
     def run(self, image, img_src, src_info, **kwargs):
+        profile = {} if self.profile_enabled else None
+        t_total = time.perf_counter()
+        t0 = time.perf_counter()
         img_bgr = image
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        if profile is not None:
+            profile["cvt_bgr_rgb"] = time.perf_counter() - t0
+            t0 = time.perf_counter()
         I_p_pstbk = torch.from_numpy(img_src).to(self.device).float()
+        if profile is not None:
+            profile["upload_source"] = time.perf_counter() - t0
+            t0 = time.perf_counter()
         realtime = kwargs.get("realtime", False)
         if self.cfg.infer_params.flag_crop_driving_video:
             if self.src_lmk_pre is None:
@@ -533,9 +563,18 @@ class FasterLivePortraitPipeline:
             lmk_crop = lmk.copy()
             img_crop = cv2.resize(img_rgb, (256, 256))
 
+        if profile is not None:
+            profile["face_landmark_crop"] = time.perf_counter() - t0
+            t0 = time.perf_counter()
         input_eye_ratio = calc_eye_close_ratio(lmk_crop[None])
         input_lip_ratio = calc_lip_close_ratio(lmk_crop[None])
+        if profile is not None:
+            profile["eye_lip_ratio"] = time.perf_counter() - t0
+            t0 = time.perf_counter()
         pitch, yaw, roll, t, exp, scale, kp = self.model_dict["motion_extractor"].predict(img_crop)
+        if profile is not None:
+            profile["motion_extractor"] = time.perf_counter() - t0
+            t0 = time.perf_counter()
         x_d_i_info = {
             "pitch": pitch,
             "yaw": yaw,
@@ -552,6 +591,9 @@ class FasterLivePortraitPipeline:
             x_d_i_info_copy[key] = x_d_i_info_copy[key].astype(np.float32)
         dri_motion_info = [x_d_i_info_copy, copy.deepcopy(input_eye_ratio.astype(np.float32)),
                            copy.deepcopy(input_lip_ratio.astype(np.float32))]
+        if profile is not None:
+            profile["rotation_copy"] = time.perf_counter() - t0
+            t0 = time.perf_counter()
         if kwargs.get("first_frame", False) or self.R_d_0 is None:
             self.frame_id = 0
             self.R_d_0 = R_d_i.copy()
@@ -564,6 +606,11 @@ class FasterLivePortraitPipeline:
         out_crop, I_p_pstbk = self._run(src_info, x_d_i_info, x_d_0_info, R_d_i, R_d_0, realtime, input_eye_ratio,
                                         input_lip_ratio,
                                         I_p_pstbk, **kwargs)
+        if profile is not None:
+            profile["animate_run"] = time.perf_counter() - t0
+            profile["frame_total"] = time.perf_counter() - t_total
+            profile.update(self._last_profile)
+            self._last_profile = profile
         return img_crop, out_crop, I_p_pstbk, dri_motion_info
 
     def run_with_pkl(self, dri_motion_info, img_src, src_info, **kwargs):

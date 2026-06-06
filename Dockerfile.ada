@@ -10,18 +10,18 @@
 FROM nvidia/cuda:12.8.1-devel-ubuntu22.04 AS ort-builder
 
 ENV DEBIAN_FRONTEND=noninteractive
+ARG ORT_BUILD_PARALLELISM=2
+ARG CUDA_ARCHITECTURES=89
+ENV CMAKE_BUILD_PARALLEL_LEVEL=${ORT_BUILD_PARALLELISM} \
+    MAX_JOBS=${ORT_BUILD_PARALLELISM}
 
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-dev python3-pip python3-venv \
     git ninja-build build-essential wget
 
 # Install cuDNN 8 from NVIDIA's apt repo (8.9.7 is the last 8.x, compatible
 # with CUDA 12.x despite the +cuda12.2 label in the package version).
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    wget -qO /tmp/cuda-keyring.deb \
+RUN wget -qO /tmp/cuda-keyring.deb \
         https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb && \
     dpkg -i /tmp/cuda-keyring.deb && \
     rm /tmp/cuda-keyring.deb && \
@@ -38,8 +38,7 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 # Pin to cmake 3.29 — cmake 4.x breaks FetchContent deps with old
 # cmake_minimum_required declarations.
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --upgrade pip setuptools wheel "cmake==3.29.6" numpy
+RUN pip install --upgrade pip setuptools wheel "cmake==3.29.6" numpy
 
 RUN git clone --branch liqun/ImageDecoder-cuda --depth 1 \
     https://github.com/microsoft/onnxruntime /onnxruntime
@@ -55,10 +54,8 @@ RUN git clone https://gitlab.com/libeigen/eigen.git /tmp/eigen-src && \
 RUN sed -i '1s/^/#include <cfloat>\n/' \
     onnxruntime/contrib_ops/cuda/moe/ft_moe/moe_kernel.cu
 
-# Cache mount keeps the CMake build dir between runs for incremental rebuilds.
-# Wheel is copied out to /opt/ so the runtime stage can reach it via COPY --from.
-RUN --mount=type=cache,id=ort-build-sm89,target=/onnxruntime/build \
-    ./build.sh \
+# Wheel is copied out with its original filename so pip accepts it.
+RUN ./build.sh \
     --cmake_path /opt/venv/bin/cmake \
     --build_shared_lib \
     --use_cuda \
@@ -68,13 +65,15 @@ RUN --mount=type=cache,id=ort-build-sm89,target=/onnxruntime/build \
     --config Release \
     --build_wheel \
     --skip_tests \
-    --cmake_extra_defines CMAKE_CUDA_ARCHITECTURES="89" \
+    --cmake_extra_defines CMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES}" \
     --cmake_extra_defines CMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
     --cmake_extra_defines FETCHCONTENT_SOURCE_DIR_EIGEN=/tmp/eigen-src \
+    --disable_contrib_ops \
     --compile_no_warning_as_error \
-    --parallel \
+    --parallel ${ORT_BUILD_PARALLELISM} \
     --allow_running_as_root && \
-    cp /onnxruntime/build/Linux/Release/dist/onnxruntime_gpu*.whl /opt/ort_custom.whl
+    mkdir -p /opt/ort && \
+    cp /onnxruntime/build/Linux/Release/dist/onnxruntime_gpu*.whl /opt/ort/
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Stage 2: Runtime image — Ubuntu 22.04 + CUDA 12.8 gives Python 3.10, matching
@@ -84,35 +83,44 @@ FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04 AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-dev python3-venv \
-    ffmpeg libgl1 libglib2.0-0 libsm6 libxext6 \
-    git
+    espeak-ng espeak-ng-data ffmpeg libgl1 libglib2.0-0 libsm6 libxext6 \
+    git wget
+
+# The custom onnxruntime wheel is built against cuDNN 8. CUDA 12.8 cuDNN base
+# images provide newer cuDNN, so install the runtime library it links to.
+RUN wget -qO /tmp/cuda-keyring.deb \
+        https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb && \
+    dpkg -i /tmp/cuda-keyring.deb && \
+    rm /tmp/cuda-keyring.deb && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends libcudnn8 && \
+    (ln -sf /usr/lib/x86_64-linux-gnu/libcudnn* /usr/local/cuda/lib64/ 2>/dev/null || true)
 
 RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
+ENV PHONEMIZER_ESPEAK_DATA=/usr/lib/x86_64-linux-gnu/espeak-ng-data \
+    ESPEAK_DATA_PATH=/usr/lib/x86_64-linux-gnu/espeak-ng-data \
+    ESPEAKNG_DATA_PATH=/usr/lib/x86_64-linux-gnu/espeak-ng-data
 
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --upgrade pip
+RUN pip install --upgrade pip
 
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install torch torchvision torchaudio \
+RUN pip install torch torchvision torchaudio \
     --index-url https://download.pytorch.org/whl/cu128
 
-COPY --from=ort-builder /opt/ort_custom.whl /opt/ort_custom.whl
+COPY --from=ort-builder /opt/ort /opt/ort
 
 WORKDIR /app
 COPY requirements.txt .
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -r requirements.txt
+RUN pip install -r requirements.txt
 
 # Force-reinstall our custom onnxruntime, overriding any stock version that
 # insightface or another transitive dep may have pulled in above
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --force-reinstall /opt/ort_custom.whl && \
-    rm /opt/ort_custom.whl
+RUN pip uninstall -y onnxruntime onnxruntime-gpu || true && \
+    pip install --force-reinstall /opt/ort/*.whl && \
+    python3 -c 'import onnxruntime as ort; providers = ort.get_available_providers(); print("ONNX Runtime providers:", providers); assert "CUDAExecutionProvider" in providers, providers' && \
+    rm -rf /opt/ort
 
 COPY . .
 

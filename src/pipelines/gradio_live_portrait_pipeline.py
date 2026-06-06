@@ -32,6 +32,109 @@ else:
     FFMPEG = "ffmpeg"
 
 
+def mux_audio(video_path, audio_path, output_path, duration=None):
+    command = [
+        FFMPEG, "-y",
+        "-i", video_path,
+        "-i", audio_path,
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-shortest",
+    ]
+    if duration is not None:
+        command.extend(["-t", str(duration)])
+    command.append(output_path)
+    return subprocess.call(command)
+
+
+def patch_espeak_wrapper():
+    try:
+        from phonemizer.backend.espeak.api import EspeakAPI
+        from phonemizer.backend.espeak.wrapper import EspeakWrapper
+    except Exception:
+        return
+
+    def find_espeak_data_path(data_path=None):
+        candidates = [
+            data_path,
+            os.environ.get("PHONEMIZER_ESPEAK_DATA"),
+            os.environ.get("ESPEAK_DATA_PATH"),
+            os.environ.get("ESPEAKNG_DATA_PATH"),
+        ]
+        try:
+            import espeakng_loader
+            candidates.append(espeakng_loader.get_data_path())
+        except Exception:
+            pass
+        candidates.extend([
+            "/usr/lib/x86_64-linux-gnu/espeak-ng-data",
+            "/usr/share/espeak-ng-data",
+        ])
+        for candidate in candidates:
+            if candidate and os.path.exists(os.path.join(candidate, "phontab")):
+                return candidate
+        return data_path
+
+    def set_data_path(cls, data_path):
+        data_path = find_espeak_data_path(data_path)
+        cls._ESPEAK_DATA_PATH = data_path
+        if data_path:
+            os.environ["PHONEMIZER_ESPEAK_DATA"] = data_path
+            os.environ["ESPEAK_DATA_PATH"] = data_path
+            os.environ["ESPEAKNG_DATA_PATH"] = data_path
+        return data_path
+
+    EspeakWrapper.set_data_path = classmethod(set_data_path)
+    EspeakWrapper.set_data_path(find_espeak_data_path())
+
+    if getattr(EspeakAPI, "_flp_data_path_patch", False):
+        return
+
+    def init_with_data_path(self, library):
+        import atexit
+        import ctypes
+        import pathlib
+        import shutil
+        import sys
+        import tempfile
+        import weakref
+        from ctypes import CDLL
+
+        self._library = None
+        try:
+            espeak: CDLL = ctypes.cdll.LoadLibrary(str(library))
+            library_path = self._shared_library_path(espeak)
+            del espeak
+        except OSError as error:
+            raise RuntimeError(f"failed to load espeak library: {str(error)}") from None
+
+        self._tempdir = tempfile.mkdtemp()
+        if sys.platform == "win32":
+            atexit.register(self._delete_win32)
+        else:
+            weakref.finalize(self, self._delete, self._library, self._tempdir)
+
+        espeak_copy = pathlib.Path(self._tempdir) / library_path.name
+        shutil.copy(library_path, espeak_copy, follow_symlinks=False)
+
+        self._library = ctypes.cdll.LoadLibrary(str(espeak_copy))
+        data_path = getattr(EspeakWrapper, "_ESPEAK_DATA_PATH", None)
+        data_path = find_espeak_data_path(data_path)
+        try:
+            data_path_bytes = data_path.encode("utf-8") if data_path else None
+            if self._library.espeak_Initialize(0x02, 0, data_path_bytes, 0) <= 0:
+                raise RuntimeError("failed to initialize espeak shared library")
+        except AttributeError:
+            raise RuntimeError("failed to load espeak library") from None
+
+        self._library_path = library_path
+
+    EspeakAPI.__init__ = init_with_data_path
+    EspeakAPI._flp_data_path_patch = True
+
+
 class GradioLivePortraitPipeline(FasterLivePortraitPipeline):
     def __init__(self, cfg, **kwargs):
         super(GradioLivePortraitPipeline, self).__init__(cfg, **kwargs)
@@ -224,11 +327,16 @@ class GradioLivePortraitPipeline(FasterLivePortraitPipeline):
         vout_org = cv2.VideoWriter(vsave_org_path, fourcc, fps, (w, h))
 
         infer_times = []
+        profile_sums = {}
+        profile_count = 0
         for i in tqdm(range(max_frame)):
+            t_read = time.perf_counter()
             ret, frame = vcap.read()
             if not ret:
                 break
+            read_time = time.perf_counter() - t_read
             t0 = time.time()
+            t_run = time.perf_counter()
             first_frame = i == 0
             if self.is_source_video:
                 dri_crop, out_crop, out_org = self.run(frame, self.src_imgs[i], self.src_infos[i],
@@ -236,9 +344,11 @@ class GradioLivePortraitPipeline(FasterLivePortraitPipeline):
             else:
                 dri_crop, out_crop, out_org = self.run(frame, self.src_imgs[0], self.src_infos[0],
                                                        first_frame=first_frame)[:3]
+            run_time = time.perf_counter() - t_run
             if out_crop is None:
                 print(f"no face in driving frame:{i}")
                 continue
+            t_post_write = time.perf_counter()
             infer_times.append(time.time() - t0)
             dri_crop = cv2.resize(dri_crop, (512, 512))
             out_crop = np.concatenate([dri_crop, out_crop], axis=1)
@@ -246,45 +356,35 @@ class GradioLivePortraitPipeline(FasterLivePortraitPipeline):
             vout_crop.write(out_crop)
             out_org = cv2.cvtColor(out_org, cv2.COLOR_RGB2BGR)
             vout_org.write(out_org)
+            if self.profile_enabled:
+                frame_profile = {
+                    "video_read": read_time,
+                    "run_call": run_time,
+                    "post_write": time.perf_counter() - t_post_write,
+                }
+                frame_profile.update(getattr(self, "_last_profile", {}))
+                for key, value in frame_profile.items():
+                    profile_sums[key] = profile_sums.get(key, 0.0) + value
+                profile_count += 1
         total_time = time.time() - t00
         vcap.release()
         vout_crop.release()
         vout_org.release()
+        if self.profile_enabled and profile_count:
+            print("FLP_PROFILE average seconds per processed frame:")
+            for key, value in sorted(profile_sums.items(), key=lambda item: item[1], reverse=True):
+                print(f"  {key}: {value / profile_count:.4f}")
 
         if video_has_audio(driving_video_path):
             vsave_crop_path_new = os.path.splitext(vsave_crop_path)[0] + "-audio.mp4"
             vsave_org_path_new = os.path.splitext(vsave_org_path)[0] + "-audio.mp4"
             if self.is_source_video:
                 duration, fps = utils.get_video_info(vsave_crop_path)
-                subprocess.call(
-                    [FFMPEG, "-i", vsave_crop_path, "-i", driving_video_path,
-                     "-b:v", "10M", "-c:v", "libx264", "-map", "0:v", "-map", "1:a",
-                     "-c:a", "aac", "-pix_fmt", "yuv420p",
-                     "-shortest",  # 以最短的流为基准
-                     "-t", str(duration),  # 设置时长
-                     "-r", str(fps),  # 设置帧率
-                     vsave_crop_path_new, "-y"])
-                subprocess.call(
-                    [FFMPEG, "-i", vsave_org_path, "-i", driving_video_path,
-                     "-b:v", "10M", "-c:v", "libx264", "-map", "0:v", "-map", "1:a",
-                     "-c:a", "aac", "-pix_fmt", "yuv420p",
-                     "-shortest",  # 以最短的流为基准
-                     "-t", str(duration),  # 设置时长
-                     "-r", str(fps),  # 设置帧率
-                     vsave_org_path_new, "-y"])
+                mux_audio(vsave_crop_path, driving_video_path, vsave_crop_path_new, duration)
+                mux_audio(vsave_org_path, driving_video_path, vsave_org_path_new, duration)
             else:
-                subprocess.call(
-                    [FFMPEG, "-i", vsave_crop_path, "-i", driving_video_path,
-                     "-b:v", "10M", "-c:v",
-                     "libx264", "-map", "0:v", "-map", "1:a",
-                     "-c:a", "aac",
-                     "-pix_fmt", "yuv420p", vsave_crop_path_new, "-y", "-shortest"])
-                subprocess.call(
-                    [FFMPEG, "-i", vsave_org_path, "-i", driving_video_path,
-                     "-b:v", "10M", "-c:v",
-                     "libx264", "-map", "0:v", "-map", "1:a",
-                     "-c:a", "aac",
-                     "-pix_fmt", "yuv420p", vsave_org_path_new, "-y", "-shortest"])
+                mux_audio(vsave_crop_path, driving_video_path, vsave_crop_path_new)
+                mux_audio(vsave_org_path, driving_video_path, vsave_org_path_new)
 
             return vsave_org_path_new, vsave_crop_path_new, total_time
         else:
@@ -401,22 +501,8 @@ class GradioLivePortraitPipeline(FasterLivePortraitPipeline):
         vsave_org_path_new = os.path.splitext(vsave_org_path)[0] + "-audio.mp4"
 
         duration, fps = utils.get_video_info(vsave_crop_path)
-        subprocess.call(
-            [FFMPEG, "-i", vsave_crop_path, "-i", driving_audio_path,
-             "-b:v", "10M", "-c:v", "libx264", "-map", "0:v", "-map", "1:a",
-             "-c:a", "aac", "-pix_fmt", "yuv420p",
-             "-shortest",  # 以最短的流为基准
-             "-t", str(duration),  # 设置时长
-             "-r", str(fps),  # 设置帧率
-             vsave_crop_path_new, "-y"])
-        subprocess.call(
-            [FFMPEG, "-i", vsave_org_path, "-i", driving_audio_path,
-             "-b:v", "10M", "-c:v", "libx264", "-map", "0:v", "-map", "1:a",
-             "-c:a", "aac", "-pix_fmt", "yuv420p",
-             "-shortest",  # 以最短的流为基准
-             "-t", str(duration),  # 设置时长
-             "-r", str(fps),  # 设置帧率
-             vsave_org_path_new, "-y"])
+        mux_audio(vsave_crop_path, driving_audio_path, vsave_crop_path_new, duration)
+        mux_audio(vsave_org_path, driving_audio_path, vsave_org_path_new, duration)
 
         return vsave_org_path_new, vsave_crop_path_new, time.time() - t00
 
@@ -436,6 +522,7 @@ class GradioLivePortraitPipeline(FasterLivePortraitPipeline):
             # if you install in different path, remember to change below envs
             os.environ["PHONEMIZER_ESPEAK_LIBRARY"] = r"C:\Program Files\eSpeak NG\libespeak-ng.dll"
             os.environ["PHONEMIZER_ESPEAK_PATH"] = r"C:\Program Files\eSpeak NG\espeak-ng.exe"
+        patch_espeak_wrapper()
         from kokoro import KPipeline, KModel
         import soundfile as sf
         import json

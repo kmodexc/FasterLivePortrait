@@ -13,6 +13,7 @@ import torchaudio
 import numpy as np
 import torch.nn.functional as F
 import pickle
+import soundfile as sf
 from tqdm import tqdm
 import pathlib
 import os
@@ -20,6 +21,12 @@ import os
 from ..models.JoyVASA.dit_talking_head import DitTalkingHead
 from ..models.JoyVASA.helper import NullableArgs
 from ..utils import utils
+
+
+def load_audio(audio_path):
+    audio, sample_rate = sf.read(audio_path, dtype="float32", always_2d=True)
+    audio = torch.from_numpy(audio.T.copy())
+    return audio, sample_rate
 
 
 class JoyVASAAudio2MotionPipeline:
@@ -36,7 +43,9 @@ class JoyVASAAudio2MotionPipeline:
         motion_model_path = kwargs.get("motion_model_path", "")
         audio_model_path = kwargs.get("audio_model_path", "")
         motion_template_path = kwargs.get("motion_template_path", "")
-        model_data = torch.load(motion_model_path, map_location="cpu")
+        # JoyVASA checkpoints include argparse.Namespace metadata in addition
+        # to tensors, which PyTorch 2.6+ blocks unless weights_only is disabled.
+        model_data = torch.load(motion_model_path, map_location="cpu", weights_only=False)
         model_args = NullableArgs(model_data['args'])
         model = DitTalkingHead(motion_feat_dim=model_args.motion_feat_dim,
                                n_motions=model_args.n_motions,
@@ -71,7 +80,7 @@ class JoyVASAAudio2MotionPipeline:
     @torch.inference_mode()
     def gen_motion_sequence(self, audio_path, **kwargs):
         # preprocess audio
-        audio, sample_rate = torchaudio.load(audio_path)
+        audio, sample_rate = load_audio(audio_path)
         if sample_rate != 16000:
             audio = torchaudio.functional.resample(
                 audio,
