@@ -73,6 +73,90 @@ Issues fixed while debugging:
   JoyVASA HuBERT/Wav2Vec2 encoders load with `attn_implementation="eager"`
   because their wrappers request `output_attentions=True`.
 
+## Mona Lisa Text-To-Video Web UI
+
+A dedicated fast-path Gradio entry point was added:
+
+```bash
+docker run -it --gpus=all --rm \
+  -v "$PWD":/root/FasterLivePortrait \
+  -w /root/FasterLivePortrait \
+  -p 9871:9871 \
+  flp python3 mona_lisa_webui.py --mode onnx --host_ip 0.0.0.0 --port 9871
+```
+
+Files involved:
+
+- `mona_lisa_webui.py`
+- `assets/examples/source/mona_lisa.jpg`
+- `src/pipelines/gradio_live_portrait_pipeline.py`
+- `src/pipelines/faster_live_portrait_pipeline.py`
+
+Behavior and speed-oriented changes:
+
+- The site uses a fixed Mona Lisa source image and only accepts text/voice
+  settings.
+- The source image and Kokoro voice pipeline are prewarmed/cached at startup.
+- `GradioLivePortraitPipeline` now caches Kokoro model, voices, and language
+  pipelines via `get_kokoro_pipeline()`.
+- The Mona app shows detailed timing: Kokoro, JoyVASA, render, muxing, frame
+  count, per-frame model time, and ONNX Runtime providers.
+- Crop-only output is the default. When `Full Painting` is off, the render path
+  skips full original-frame upload/download, paste-back, full-video writing, and
+  full-video audio muxing.
+- A `Frame Step` slider was added. It renders every Nth motion frame and lowers
+  output FPS so audio duration stays aligned. This trades smoothness for lower
+  latency.
+
+Measured user run in ONNX mode on an RTX 4070 Laptop GPU at 100 W:
+
+- Total button-to-ready time: about 25 seconds for 112 frames.
+- Render loop: about 23.6 seconds.
+- Effective render rate: about 4.7 FPS.
+- `warping_spade` dominates: about 0.208 seconds per frame.
+- Video encode/write, Kokoro, JoyVASA, and muxing are not significant
+  bottlenecks.
+- ONNX Runtime reported `CUDAExecutionProvider, CPUExecutionProvider` for
+  `warping_spade`; GPU utilization was 99% and power was 100/100 W, so this was
+  not an idle GPU or obvious CPU fallback case.
+
+Current conclusion:
+
+- In ONNX mode the practical bottleneck is the LivePortrait `warping_spade`
+  model, specifically the grid-sample-heavy path.
+- `warping_spade.onnx` contains `GridSample` nodes.
+- ONNX Runtime documentation now lists CUDA support for `GridSample` for some
+  opset/type combinations, so the README claim that grid sample cannot be
+  executed by ONNX Runtime is too broad/outdated. For this setup it appears to
+  execute on the GPU but slowly.
+- The README's TensorRT recommendation still looks correct for real-time
+  performance. The repo claims 30+ FPS on an RTX 3090 with TensorRT.
+- Local checkpoint tree currently contains ONNX files but no `.trt` engines.
+
+Recommended next performance step:
+
+```bash
+docker run -it --gpus=all --rm \
+  -v "$PWD":/root/FasterLivePortrait \
+  -w /root/FasterLivePortrait \
+  flp sh scripts/all_onnx2trt.sh
+```
+
+Then run the Mona app with TensorRT:
+
+```bash
+docker run -it --gpus=all --rm \
+  -v "$PWD":/root/FasterLivePortrait \
+  -w /root/FasterLivePortrait \
+  -p 9871:9871 \
+  flp python3 mona_lisa_webui.py --mode trt --host_ip 0.0.0.0 --port 9871
+```
+
+If trying TensorRT on Blackwell/RTX 50-series hardware, prefer the existing
+`Dockerfile.blackwell` path if the current image/tooling cannot build/load TRT
+engines. The `grid_sample_3d` TensorRT plugin must load successfully, and
+`warping_spade-fix.trt` is the key engine for this bottleneck.
+
 ## Required Checkpoints
 
 The README commands for audio/text driving are:
@@ -94,7 +178,9 @@ may be owned by another user:
 
 ```bash
 PYTHONPYCACHEPREFIX=/tmp/flp-pycache python3 -m py_compile \
+  mona_lisa_webui.py \
   src/pipelines/gradio_live_portrait_pipeline.py \
+  src/pipelines/faster_live_portrait_pipeline.py \
   src/pipelines/joyvasa_audio_to_motion_pipeline.py \
   src/models/JoyVASA/dit_talking_head.py \
   src/models/JoyVASA/hubert.py \

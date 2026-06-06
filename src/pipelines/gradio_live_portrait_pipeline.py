@@ -140,6 +140,55 @@ class GradioLivePortraitPipeline(FasterLivePortraitPipeline):
         super(GradioLivePortraitPipeline, self).__init__(cfg, **kwargs)
         self.joyvasa_pipe = None
         self.kokoro_model = None
+        self.kokoro_pipelines = {}
+        self.kokoro_voices = None
+
+    def get_kokoro_pipeline(self, voice_name):
+        if platform.system() == "Windows":
+            # refer: https://huggingface.co/hexgrad/Kokoro-82M/discussions/12
+            # if you install in different path, remember to change below envs
+            os.environ["PHONEMIZER_ESPEAK_LIBRARY"] = r"C:\Program Files\eSpeak NG\libespeak-ng.dll"
+            os.environ["PHONEMIZER_ESPEAK_PATH"] = r"C:\Program Files\eSpeak NG\espeak-ng.exe"
+        patch_espeak_wrapper()
+        from kokoro import KPipeline, KModel
+        import json
+
+        if self.kokoro_model is None:
+            with open("checkpoints/Kokoro-82M/config.json", "r", encoding="utf-8") as fin:
+                model_config = json.load(fin)
+            self.kokoro_model = KModel(config=model_config, model="checkpoints/Kokoro-82M/kokoro-v1_0.pth")
+            self.kokoro_model.voices = {}
+
+        if self.kokoro_voices is None:
+            self.kokoro_voices = {}
+            voice_path = "checkpoints/Kokoro-82M/voices"
+            for vname in os.listdir(voice_path):
+                if vname.endswith(".pt"):
+                    self.kokoro_voices[os.path.splitext(vname)[0]] = torch.load(
+                        os.path.join(voice_path, vname),
+                        weights_only=True,
+                    )
+
+        lang_code = voice_name[0]
+        if lang_code not in self.kokoro_pipelines:
+            pipeline = KPipeline(lang_code=lang_code, model=self.kokoro_model)
+            pipeline.voices.update(self.kokoro_voices)
+            self.kokoro_pipelines[lang_code] = pipeline
+
+        return self.kokoro_pipelines[lang_code]
+
+    def get_runtime_summary(self):
+        lines = []
+        for model_name, model in sorted(self.model_dict.items()):
+            predictor = getattr(model, "predictor", None)
+            onnx_model = getattr(predictor, "onnx_model", None)
+            if onnx_model is not None and hasattr(onnx_model, "get_providers"):
+                providers = ", ".join(onnx_model.get_providers())
+                lines.append(f"runtime_{model_name}: {providers}")
+            else:
+                predict_type = getattr(model, "predict_type", type(predictor).__name__)
+                lines.append(f"runtime_{model_name}: {predict_type}")
+        return lines
 
     def execute_video(
             self,
@@ -392,6 +441,20 @@ class GradioLivePortraitPipeline(FasterLivePortraitPipeline):
 
     def run_pickle_driving(self, driving_pickle_path, source_path, **kwargs):
         t00 = time.time()
+        render_timings = kwargs.get("render_timings")
+        render_full_video = kwargs.get("render_full_video", True)
+        force_profile = render_timings is not None
+        profile_enabled_prev = self.profile_enabled
+        if force_profile:
+            self.profile_enabled = True
+        if render_timings is not None:
+            render_timings.update({
+                "render_frames": 0,
+                "render_model_total": 0.0,
+                "render_crop_write_total": 0.0,
+                "render_full_write_total": 0.0,
+                "render_loop_overhead_total": 0.0,
+            })
 
         if self.source_path != source_path or kwargs.get("update_ret", False):
             # 如果不一样要重新初始化变量
@@ -399,6 +462,8 @@ class GradioLivePortraitPipeline(FasterLivePortraitPipeline):
             ret = self.prepare_source(source_path)
             if not ret:
                 raise gr.Error(f"Error in processing source:{source_path} 💥!", duration=5)
+            if force_profile:
+                self.profile_enabled = True
 
         with open(driving_pickle_path, "rb") as fin:
             dri_motion_infos = pickle.load(fin)
@@ -420,6 +485,9 @@ class GradioLivePortraitPipeline(FasterLivePortraitPipeline):
             max_frame = min(dframe, len(self.src_imgs))
         else:
             max_frame = dframe
+        render_stride = max(1, int(kwargs.get("render_stride", 1)))
+        frame_indices = list(range(0, max_frame, render_stride))
+        output_fps = fps / render_stride
         h, w = self.src_imgs[0].shape[:2]
         save_dir = kwargs.get("save_dir", f"./results/{datetime.datetime.now().strftime('%Y-%m-%d-%H%M%S')}")
         os.makedirs(save_dir, exist_ok=True)
@@ -428,13 +496,15 @@ class GradioLivePortraitPipeline(FasterLivePortraitPipeline):
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         vsave_crop_path = os.path.join(save_dir,
                                        f"{os.path.basename(source_path)}-{os.path.basename(driving_pickle_path)}-crop.mp4")
-        vout_crop = cv2.VideoWriter(vsave_crop_path, fourcc, fps, (512, 512))
+        vout_crop = cv2.VideoWriter(vsave_crop_path, fourcc, output_fps, (512, 512))
         vsave_org_path = os.path.join(save_dir,
                                       f"{os.path.basename(source_path)}-{os.path.basename(driving_pickle_path)}-org.mp4")
-        vout_org = cv2.VideoWriter(vsave_org_path, fourcc, fps, (w, h))
+        vout_org = cv2.VideoWriter(vsave_org_path, fourcc, output_fps, (w, h)) if render_full_video else None
 
         infer_times = []
-        for frame_ind in tqdm(range(max_frame)):
+        profile_sums = {}
+        for frame_ind in tqdm(frame_indices):
+            t_frame = time.perf_counter()
             t0 = time.time()
             first_frame = frame_ind == 0
             dri_motion_info_ = [motion_lst[frame_ind]]
@@ -449,21 +519,64 @@ class GradioLivePortraitPipeline(FasterLivePortraitPipeline):
             if self.is_source_video:
                 out_crop, out_org = self.run_with_pkl(dri_motion_info_, self.src_imgs[frame_ind],
                                                       self.src_infos[frame_ind],
-                                                      first_frame=first_frame)[:3]
+                                                      first_frame=first_frame,
+                                                      return_org=render_full_video)[:3]
             else:
                 out_crop, out_org = self.run_with_pkl(dri_motion_info_, self.src_imgs[0], self.src_infos[0],
-                                                      first_frame=first_frame)[:3]
+                                                      first_frame=first_frame,
+                                                      return_org=render_full_video)[:3]
+            model_time = time.time() - t0
             if out_crop is None:
                 print(f"no face in driving frame:{frame_ind}")
                 continue
-            infer_times.append(time.time() - t0)
+            infer_times.append(model_time)
+            if render_timings is not None:
+                render_timings["render_model_total"] += model_time
+                for key, value in getattr(self, "_last_profile", {}).items():
+                    profile_sums[key] = profile_sums.get(key, 0.0) + value
+
+            t_write = time.perf_counter()
             out_crop = cv2.cvtColor(out_crop, cv2.COLOR_RGB2BGR)
             vout_crop.write(out_crop)
-            out_org = cv2.cvtColor(out_org, cv2.COLOR_RGB2BGR)
-            vout_org.write(out_org)
+            crop_write_time = time.perf_counter() - t_write
+            if render_timings is not None:
+                render_timings["render_crop_write_total"] += crop_write_time
+
+            full_write_time = 0.0
+            if render_full_video:
+                t_write = time.perf_counter()
+                out_org = cv2.cvtColor(out_org, cv2.COLOR_RGB2BGR)
+                vout_org.write(out_org)
+                full_write_time = time.perf_counter() - t_write
+                if render_timings is not None:
+                    render_timings["render_full_write_total"] += full_write_time
+
+            if render_timings is not None:
+                render_timings["render_frames"] += 1
+                frame_total = time.perf_counter() - t_frame
+                accounted = model_time + crop_write_time + full_write_time
+                render_timings["render_loop_overhead_total"] += max(frame_total - accounted, 0.0)
         total_time = time.time() - t00
         vout_crop.release()
-        vout_org.release()
+        if vout_org is not None:
+            vout_org.release()
+        if force_profile:
+            self.profile_enabled = profile_enabled_prev
+
+        if render_timings is not None:
+            frame_count = render_timings["render_frames"]
+            render_timings["render_total"] = total_time
+            render_timings["render_input_frames"] = max_frame
+            render_timings["render_stride"] = render_stride
+            render_timings["render_output_fps"] = output_fps
+            if frame_count:
+                render_timings["render_seconds_per_frame"] = total_time / frame_count
+                render_timings["render_model_seconds_per_frame"] = render_timings["render_model_total"] / frame_count
+                render_timings["render_crop_write_seconds_per_frame"] = render_timings["render_crop_write_total"] / frame_count
+                render_timings["render_full_write_seconds_per_frame"] = render_timings["render_full_write_total"] / frame_count
+                render_timings["render_actual_fps"] = frame_count / total_time if total_time else 0.0
+                for key, value in profile_sums.items():
+                    render_timings[f"render_profile_{key}_per_frame"] = value / frame_count
 
         return vsave_org_path, vsave_crop_path, total_time
 
@@ -506,36 +619,87 @@ class GradioLivePortraitPipeline(FasterLivePortraitPipeline):
 
         return vsave_org_path_new, vsave_crop_path_new, time.time() - t00
 
-    def run_text_driving(self, driving_text, voice_name, source_path, **kwargs):
+    def run_audio_driving_profiled(self, driving_audio_path, source_path, **kwargs):
+        timings = {}
+        t_total = time.perf_counter()
+
         if self.source_path != source_path or kwargs.get("update_ret", False):
-            # 如果不一样要重新初始化变量
+            t0 = time.perf_counter()
             self.init_vars(**kwargs)
             ret = self.prepare_source(source_path)
+            timings["source_prepare"] = time.perf_counter() - t0
             if not ret:
                 raise gr.Error(f"Error in processing source:{source_path} 💥!", duration=5)
+        else:
+            timings["source_prepare"] = 0.0
+
         save_dir = kwargs.get("save_dir", f"./results/{datetime.datetime.now().strftime('%Y-%m-%d-%H%M%S')}")
         os.makedirs(save_dir, exist_ok=True)
-        # TODO: make it better
-        import platform
-        if platform.system() == "Windows":
-            # refer: https://huggingface.co/hexgrad/Kokoro-82M/discussions/12
-            # if you install in different path, remember to change below envs
-            os.environ["PHONEMIZER_ESPEAK_LIBRARY"] = r"C:\Program Files\eSpeak NG\libespeak-ng.dll"
-            os.environ["PHONEMIZER_ESPEAK_PATH"] = r"C:\Program Files\eSpeak NG\espeak-ng.exe"
-        patch_espeak_wrapper()
-        from kokoro import KPipeline, KModel
+
+        if self.joyvasa_pipe is None:
+            t0 = time.perf_counter()
+            self.joyvasa_pipe = JoyVASAAudio2MotionPipeline(motion_model_path=self.cfg.joyvasa_models.motion_model_path,
+                                                            audio_model_path=self.cfg.joyvasa_models.audio_model_path,
+                                                            motion_template_path=self.cfg.joyvasa_models.motion_template_path,
+                                                            cfg_mode=self.cfg.infer_params.cfg_mode,
+                                                            cfg_scale=self.cfg.infer_params.cfg_scale
+                                                            )
+            timings["joyvasa_init"] = time.perf_counter() - t0
+        else:
+            timings["joyvasa_init"] = 0.0
+
+        t0 = time.perf_counter()
+        dri_motion_infos = self.joyvasa_pipe.gen_motion_sequence(driving_audio_path)
+        timings["joyvasa_generate"] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        motion_pickle_path = os.path.join(save_dir,
+                                          f"{os.path.basename(source_path)}-{os.path.basename(driving_audio_path)}.pkl")
+        with open(motion_pickle_path, "wb") as fw:
+            pickle.dump(dri_motion_infos, fw)
+        timings["motion_pickle_write"] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        render_timings = {}
+        vsave_org_path, vsave_crop_path, render_time = self.run_pickle_driving(
+            motion_pickle_path,
+            source_path,
+            save_dir=save_dir,
+            render_timings=render_timings,
+            render_full_video=kwargs.get("render_full_video", True),
+            render_stride=kwargs.get("render_stride", 1),
+        )
+        timings["render_video"] = time.perf_counter() - t0
+        timings["render_video_inner"] = render_time
+        timings.update(render_timings)
+
+        vsave_crop_path_new = os.path.splitext(vsave_crop_path)[0] + "-audio.mp4"
+        vsave_org_path_new = os.path.splitext(vsave_org_path)[0] + "-audio.mp4"
+
+        t0 = time.perf_counter()
+        duration, fps = utils.get_video_info(vsave_crop_path)
+        timings["video_info"] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        mux_audio(vsave_crop_path, driving_audio_path, vsave_crop_path_new, duration)
+        timings["mux_crop_audio"] = time.perf_counter() - t0
+
+        if kwargs.get("mux_full_audio", True):
+            t0 = time.perf_counter()
+            mux_audio(vsave_org_path, driving_audio_path, vsave_org_path_new, duration)
+            timings["mux_full_audio"] = time.perf_counter() - t0
+        else:
+            timings["mux_full_audio"] = 0.0
+            vsave_org_path_new = vsave_org_path
+
+        timings["audio_to_video_total"] = time.perf_counter() - t_total
+        return vsave_org_path_new, vsave_crop_path_new, timings["audio_to_video_total"], timings
+
+    def synthesize_text_audio(self, driving_text, voice_name, save_dir):
         import soundfile as sf
-        import json
-        with open("checkpoints/Kokoro-82M/config.json", "r", encoding="utf-8") as fin:
-            model_config = json.load(fin)
-        model = KModel(config=model_config, model="checkpoints/Kokoro-82M/kokoro-v1_0.pth")
-        pipeline = KPipeline(lang_code=voice_name[0], model=model)  # <= make sure lang_code matches voice
-        model.voices = {}
-        voice_path = "checkpoints/Kokoro-82M/voices"
-        for vname in os.listdir(voice_path):
-            pipeline.voices[os.path.splitext(vname)[0]] = torch.load(os.path.join(voice_path, vname), weights_only=True)
+        pipeline = self.get_kokoro_pipeline(voice_name)
         generator = pipeline(
-            driving_text, voice=voice_name,  # <= change voice here
+            driving_text, voice=voice_name,
             speed=1, split_pattern=r'\n+'
         )
         audios = []
@@ -545,6 +709,57 @@ class GradioLivePortraitPipeline(FasterLivePortraitPipeline):
         audio_save_path = os.path.join(save_dir, f"kokoro-82m-{voice_name}.wav")
         sf.write(audio_save_path, audios, 24000)
         print("save audio to:", audio_save_path)
+        return audio_save_path
+
+    def run_text_driving_profiled(self, driving_text, voice_name, source_path, **kwargs):
+        timings = {}
+        t_total = time.perf_counter()
+
+        if self.source_path != source_path or kwargs.get("update_ret", False):
+            t0 = time.perf_counter()
+            self.init_vars(**kwargs)
+            ret = self.prepare_source(source_path)
+            timings["source_prepare"] = time.perf_counter() - t0
+            if not ret:
+                raise gr.Error(f"Error in processing source:{source_path} 💥!", duration=5)
+        else:
+            timings["source_prepare"] = 0.0
+
+        save_dir = kwargs.get("save_dir", f"./results/{datetime.datetime.now().strftime('%Y-%m-%d-%H%M%S')}")
+        os.makedirs(save_dir, exist_ok=True)
+
+        t0 = time.perf_counter()
+        audio_save_path = self.synthesize_text_audio(driving_text, voice_name, save_dir)
+        timings["kokoro_synthesize"] = time.perf_counter() - t0
+
+        vsave_org_path, vsave_crop_path, total_time, audio_timings = self.run_audio_driving_profiled(
+            audio_save_path,
+            source_path,
+            save_dir=save_dir,
+            update_ret=False,
+            mux_full_audio=kwargs.get("mux_full_audio", True),
+            render_full_video=kwargs.get("render_full_video", True),
+            render_stride=kwargs.get("render_stride", 1),
+        )
+        for key, value in audio_timings.items():
+            if key == "source_prepare":
+                timings["source_prepare_audio_stage"] = value
+            else:
+                timings[key] = value
+
+        timings["text_to_video_total"] = time.perf_counter() - t_total
+        return vsave_org_path, vsave_crop_path, total_time, timings
+
+    def run_text_driving(self, driving_text, voice_name, source_path, **kwargs):
+        if self.source_path != source_path or kwargs.get("update_ret", False):
+            # 如果不一样要重新初始化变量
+            self.init_vars(**kwargs)
+            ret = self.prepare_source(source_path)
+            if not ret:
+                raise gr.Error(f"Error in processing source:{source_path} 💥!", duration=5)
+        save_dir = kwargs.get("save_dir", f"./results/{datetime.datetime.now().strftime('%Y-%m-%d-%H%M%S')}")
+        os.makedirs(save_dir, exist_ok=True)
+        audio_save_path = self.synthesize_text_audio(driving_text, voice_name, save_dir)
         vsave_org_path, vsave_crop_path, total_time = self.run_audio_driving(audio_save_path, source_path,
                                                                              save_dir=save_dir)
 
